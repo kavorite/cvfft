@@ -1,0 +1,6 @@
+/target
+.aider*
+**/*.png
+**/*.jpg
+**/*.bmp
+**/*.jpeg
