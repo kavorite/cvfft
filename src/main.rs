@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use image::imageops::resize;
-use image::imageops::FilterType::Lanczos3;
 use image::{ImageBuffer, Rgb};
 use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
 use ndarray::Array2;
+use polars::prelude::*;
 use rayon::prelude::*;
 use rustfft::{num_complex::Complex, FftPlanner};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
@@ -26,6 +26,9 @@ struct Args {
     #[arg(short, long)]
     output_dir: String,
 
+    #[arg(short, long)]
+    cap_file: String,
+
     #[arg(long, default_value_t = 1536)]
     fft_size: usize,
 
@@ -43,17 +46,15 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("Failed to create output directory: {}", args.output_dir))?;
 
-    // Get all MP3 files in the input directory
-    let mp3_files: Vec<PathBuf> = WalkDir::new(&args.input_dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "mp3"))
-        .map(|entry| entry.path().to_owned())
-        .collect();
+    // Read Parquet file
+    let file_info = read_metadata(&args.cap_file)?;
+
+    // Build file cache
+    let file_cache = build_file_cache(&args.input_dir)?;
 
     // Set up progress bar
     let progress_bar = Arc::new(ProgressBar::with_draw_target(
-        Some(mp3_files.len() as u64),
+        Some(file_info.len() as u64),
         indicatif::ProgressDrawTarget::stderr(),
     ));
     progress_bar.set_style(
@@ -64,17 +65,40 @@ fn main() -> Result<()> {
     );
 
     // Process files in parallel
-    mp3_files.par_iter().try_for_each(|file| -> Result<()> {
-        let spectrogram = generate_spectrogram(file, args.fft_size, args.hop_size)?;
-        let output_path = Path::new(&args.output_dir)
-            .join(file.file_stem().unwrap())
-            .with_extension(&args.output_format);
-        save_spectrogram(&spectrogram, &output_path, &args.output_format)?;
-        progress_bar.inc(1);
-        Ok(())
-    })?;
+    file_info
+        .par_iter()
+        .try_for_each(|(id, filename)| -> Result<()> {
+            let file_stem = Path::new(filename).file_stem().unwrap().to_str().unwrap();
+            let mp3_file = file_cache
+                .get(file_stem)
+                .with_context(|| format!("Failed to find MP3 file for: {}", filename))?;
+
+            let spectrogram = generate_spectrogram(mp3_file, args.fft_size, args.hop_size)?;
+            let output_path =
+                Path::new(&args.output_dir).join(format!("{}.{}", id, args.output_format));
+            save_spectrogram(&spectrogram, &output_path, &args.output_format)?;
+            progress_bar.inc(1);
+            Ok(())
+        })?;
 
     Ok(())
+}
+
+fn build_file_cache(input_dir: &str) -> Result<HashMap<String, PathBuf>> {
+    let mut file_cache = HashMap::new();
+
+    WalkDir::new(input_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "mp3"))
+        .for_each(|entry| {
+            let path = entry.path();
+            if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                file_cache.insert(file_stem.to_string(), path.to_path_buf());
+            }
+        });
+
+    Ok(file_cache)
 }
 
 fn generate_spectrogram(file_path: &Path, fft_size: usize, hop_size: usize) -> Result<Array2<f32>> {
@@ -216,4 +240,23 @@ fn save_spectrogram(spectrogram: &Array2<f32>, output_path: &Path, format: &str)
     }
 
     Ok(())
+}
+fn read_metadata(file_path: &str) -> Result<Vec<(i64, String)>> {
+    let df = LazyFrame::scan_parquet(file_path, Default::default())?
+        .select([col("id"), col("filename")])
+        .collect()?;
+
+    let id_series = df.column("id")?.i64()?;
+    let filename_series = df.column("filename")?.str()?;
+
+    let result: Vec<(i64, String)> = id_series
+        .into_iter()
+        .zip(filename_series.into_iter())
+        .filter_map(|(id, filename)| {
+            id.zip(filename)
+                .map(|(id, filename)| (id, filename.to_string()))
+        })
+        .collect();
+
+    Ok(result)
 }
